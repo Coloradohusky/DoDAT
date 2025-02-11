@@ -309,12 +309,19 @@ static bool XMLMatchTag(char* pStart, char* pEnd, const char* tag, int tagLen, .
 
 	va_list apStart, ap;
 	va_start(apStart, tagLen);
-
-	int matchCount = 0;
-	for (va_copy(ap, apStart); va_arg(ap, const char*); matchCount++) { const char **matchOut = va_arg(ap, const char**), **matchEndOut = va_arg(ap, const char**); *matchOut = NULL; *matchEndOut = NULL; }
+	va_copy(ap, apStart);
+	int matchCount = 0, matchLens[64], n;
+	for (const char *matchParam, **matchOut, **matchEndOut; (matchParam = va_arg(ap, const char*)) != NULL; matchCount++)
+	{
+		matchLens[matchCount] = (int)strlen(matchParam);
+		*(matchOut = va_arg(ap, const char**)) = NULL;
+		if ((matchEndOut = va_arg(ap, const char**)) != NULL) *matchEndOut = NULL;
+	}
 	va_end(ap);
+	ZIP_ASSERT(matchCount < 64);
 
-	for (char* p = pStart  + tagLen;;)
+	Bit64u matchedBits = 0, bit;
+	for (char* p = pStart + tagLen;;)
 	{
 		while (*p <= ' ') p++;
 		if (p == pEnd) { va_end(apStart); return true; }
@@ -331,14 +338,13 @@ static bool XMLMatchTag(char* pStart, char* pEnd, const char* tag, int tagLen, .
 		}
 
 		va_copy(ap, apStart);
-		for (int n = 0; n != matchCount; n++)
+		for (n = 0, bit = 1; n != matchCount; n++, bit <<= 1)
 		{
 			const char *matchParam = va_arg(ap, const char*), **matchOut = va_arg(ap, const char**), **matchEndOut = va_arg(ap, const char**);
-			if (*matchParam != *paramName) continue;
-			int matchLen = (int)strlen(matchParam);
-			if (matchLen != (paramNameEnd - paramName) || memcmp(paramName, matchParam, matchLen)) continue;
+			if ((matchedBits & bit) || *matchParam != *paramName || matchLens[n] != (int)(paramNameEnd - paramName) || memcmp(paramName, matchParam, matchLens[n])) continue;
 			*matchOut = val;
-			*matchEndOut = valEnd;
+			if (matchEndOut) *matchEndOut = valEnd;
+			matchedBits |= bit;
 		}
 		va_end(ap);
 	}
@@ -634,10 +640,10 @@ struct SFileMemory : SFile
 		};
 
 		EXml x;
-		for (char *p = pRomOpenTagEnd, *pEnd = p; p && (x = XMLParse(p, pEnd)) != XML_END && x != XML_ELEM_END; p = pEnd = XMLLevel(pEnd, x))
+		for (char *p = pRomOpenTagEnd, *pEnd; p && (x = XMLParse(p, pEnd)) != XML_END && x != XML_ELEM_END; p = XMLLevel(pEnd, x))
 		{
-			char *patchData, *patchDataX, *patchSize, *patchSizeX, *patchCrc, *patchCrcX, *patchSha1, *patchSha1X;
-			if (!XMLMatchTag(p, pEnd, "patch", 5, "data", &patchData, &patchDataX, "size", &patchSize, &patchSizeX, "crc", &patchCrc, &patchCrcX, "sha1", &patchSha1, &patchSha1X, NULL)) continue;
+			char *patchData, *patchDataX, *patchSize, *patchCrc, *patchSha1;
+			if (!XMLMatchTag(p, pEnd, "patch", 5, "data", &patchData, &patchDataX, "size", &patchSize, NULL, "crc", &patchCrc, NULL, "sha1", &patchSha1, NULL, NULL)) continue;
 
 			Bit64u size = atoi64(patchSize);
 			for (SFile* fi : files)
@@ -664,6 +670,22 @@ struct SFileMemory : SFile
 			}
 		}
 		return NULL;
+	}
+
+	static bool CanPotentiallyBuildPatched(const std::vector<SFile*>& files, char* pRomOpenTagEnd)
+	{
+		EXml x;
+		for (char *p = pRomOpenTagEnd, *pEnd; p && (x = XMLParse(p, pEnd)) != XML_END && x != XML_ELEM_END; p = XMLLevel(pEnd, x))
+		{
+			char *patchData, *patchSize, *patchCrc, *patchSha1, *patchSha1X;
+			if (!XMLMatchTag(p, pEnd, "patch", 5, "data", &patchData, NULL, "size", &patchSize, NULL, "crc", &patchCrc, NULL, "sha1", &patchSha1, &patchSha1X, NULL)) continue;
+
+			const char *missField = (!patchData ? "data" : !patchSize ? "size" : !patchCrc ? "crc" : (!patchSha1 || (patchSha1X - patchSha1) != 40) ? "sha1" : NULL);
+			if (missField) { LogErr("<%s> element missing '%s' field!\n", "patch", missField); return false; }
+			Bit64u size = atoi64(patchSize);
+			for (SFile* fil : files) if (fil->size == size) return true;
+		}
+		return false;
 	}
 };
 
@@ -999,7 +1021,7 @@ struct SFileZip : SFileMemory
 			file_count++;
 		}
 
-		virtual bool Finalize(char* XmlGameInner)
+		virtual bool Finalize(char*)
 		{
 			if (failed) return false;
 			if (file_count) failed |= !fwrite(&central_dir[0], central_dir.size(), 1, f);
@@ -1024,13 +1046,13 @@ struct SFileIso : SFile
 	enum { CD_MAX_SUBCODE_DATA = 96, CD_FRAME_SIZE = RAW_SECTOR_SIZE + CD_MAX_SUBCODE_DATA, ISO_FRAMESIZE = 2048 };
 	enum { CHD_V5_HEADER_SIZE = 124, CHD_V5_UNCOMPMAPENTRYBYTES = 4, CHD_METADATA_HEADER_SIZE = 16, CHD_CDROM_TRACK_METADATA_TAG = 1128813650, CHD_CDROM_TRACK_METADATA2_TAG = 1128813618 };
 	enum { CHD_UNITBYTES = CD_FRAME_SIZE, CHD_HUNKBYTES = CHD_UNITBYTES * 8, CHD_CD_TRACK_PADDING = 4 };
-	struct BuiltTrack { std::vector<Bit8u> buf; int data_size, pregap, omitted_pregap; char ttype[16]; };
+	struct BuiltTrack { Bit8u* buf = NULL; ~BuiltTrack() { free(buf); } size_t bufsize; int data_size, pregap, omitted_pregap; char ttype[16]; };
 
 	struct IsoReader
 	{
 		// BASED ON cdrom_image.cpp of DOSBox (GPL2)
 		// Copyright (C) 2002-2021  The DOSBox Team
-		struct Track { int number, start, pregap, frames, sector_size; bool audio, mode2, zeros; SFile* file; Bit64u skip; Bit32u inzeros, outzeros; };
+		struct Track { int number, start, pregap, frames, sector_size; bool audio, mode2; Bit16s zerotag; SFile* file; Bit64u skip; Bit32u inzeros, outzeros; };
 		struct ChdState { ChdState() : hunkmap(NULL), cooked_sector_shift(0) { } ~ChdState() { free(hunkmap); } Bit32u *hunkmap; int hunkbytes, cooked_sector_shift; };
 
 		IsoReader(SFile& _src, ChdState* _chd, std::vector<IsoReader::Track>& _tracks) : src(_src), refs(0), chd(_chd), lasttrack(0), cachesector((Bit32u)-1) { tracks.swap(_tracks); for (Track& t : tracks) if (t.file &&!t.file->IsOpen()) t.file->Open(); }
@@ -1395,34 +1417,36 @@ struct SFileIso : SFile
 			return true;
 		}
 
-		bool TestOrFillTrackBuf(std::vector<BuiltTrack*>* builtTracks, int number, int frames, int data_size, const char* ttype, const char* ttypeX, int pregap, int omitted_pregap, int in_zeros, int out_zeros, const char* chdTrackSha1)
+		bool TestOrFillTrackBuf(BuiltTrack** outBuiltTrack, int frames, int data_size, int in_zeros, int out_zeros, bool skip_pregap, const char* needSha1)
 		{
-			if (number == 1 && in_zeros == 1 && out_zeros == 0) in_zeros = out_zeros = -1; // ignore zeros on data tracks
 			const Bit64u needsize = (Bit64u)(frames * data_size) - (in_zeros >= 0 ? (in_zeros + out_zeros) : 0);
 			for (Track& t : tracks)
 			{
-				const bool raw = (t.sector_size >= RAW_SECTOR_SIZE);
-				const int read_size = (size_t)ZIP_MIN(t.sector_size, data_size);
-				if (!t.zeros && in_zeros >= 0)
+				const Bit16s zerotag = (Bit16s)data_size * ((skip_pregap && t.pregap) ? -1 : 1);
+				if (in_zeros >= 0 && t.zerotag != zerotag)
 				{
-					t.zeros = true;
-					for (int i = 0; i != t.frames; i++, t.inzeros += (data_size - read_size)) for (const Bit8u *p = ReadSector((Bit32u)(t.start + i), raw), *pEnd = p + read_size; p != pEnd;) { if (*(p++)) goto doneins; t.inzeros++; }
-					doneins:
-					for (int i = t.frames; i--; t.outzeros += (data_size - read_size)) for (const Bit8u *pEnd = ReadSector((Bit32u)(t.start + i), raw), *p = pEnd + read_size; p != pEnd;) { if (*(--p)) goto doneouts; t.outzeros++; }
-					doneouts:;
+					t.zerotag = zerotag;
+					const bool raw = (t.sector_size >= RAW_SECTOR_SIZE);
+					const int read_size = ZIP_MIN(t.sector_size, data_size);
+					Bit32u inz = 0, outz = 0, sfrom = (Bit32u)(t.start + (skip_pregap ? t.pregap : 0)), sto = (Bit32u)(t.start + t.frames), tail = (Bit32u)(data_size - read_size), i;
+					for (i = sfrom; i != sto; inz += tail) { for (const Bit8u *p = ReadSector(i++, raw), *pEnd = p + read_size; p != pEnd;) { if (*(p++)) { i = sto; break; } inz++; } }
+					for (i = sto; i != sfrom; outz += tail) { for (const Bit8u *pEnd = ReadSector(--i, raw), *p = pEnd + read_size; p != pEnd;) { if (*(--p)) { i = sfrom; break; } outz++; } }
+					t.inzeros = inz;
+					t.outzeros = outz;
 				}
-				const Bit64u tSize = (Bit64u)(t.frames * data_size) - (in_zeros >= 0 ? (t.inzeros + t.outzeros) : 0);
-				if (needsize && needsize != tSize) continue;
-				if (!builtTracks) return true; // potential match
+				const Bit64u tsize = (Bit64u)((t.frames - (skip_pregap ? t.pregap : 0)) * data_size) - (in_zeros >= 0 ? (t.inzeros + t.outzeros) : 0);
+				if (needsize && needsize != tsize) continue;
+				if (!outBuiltTrack) return true; // potential match
 
-				BuiltTrack* pBT = ((int)builtTracks->size() >= number ? builtTracks->operator[](number - 1) : NULL);
-				std::vector<Bit8u> tmpbuf, &buf = (pBT ? pBT->buf : tmpbuf);
-				buf.resize(frames * data_size);
-				if (in_zeros > 0 || out_zeros > 0 || read_size != data_size) memset(&buf[0], 0, buf.size());
+				size_t bt_buf_size = frames * data_size;
+				Bit8u* bt_buf = (Bit8u*)realloc((*outBuiltTrack ? (*outBuiltTrack)->buf : NULL), bt_buf_size);
+				memset(bt_buf, 0, bt_buf_size);
+				const bool raw = (t.sector_size >= RAW_SECTOR_SIZE);
+				const int read_size = ZIP_MIN(t.sector_size, data_size);
 				if (needsize)
 				{
-					Bit8u *pTrg = &buf[0] + (in_zeros > 0 ? in_zeros : t.inzeros), *pTrgEnd = pTrg + needsize;
-					Bit32u tFrame = (Bit32u)(t.start + t.inzeros / data_size), tFrameEnd = (Bit32u)(t.start + (t.inzeros + tSize + data_size - 1) / data_size);
+					Bit8u *pTrg = bt_buf + (in_zeros > 0 ? in_zeros : t.inzeros), *pTrgEnd = pTrg + needsize - (in_zeros > 0 ? 0 : t.inzeros);
+					Bit32u tStart = (Bit32u)(t.start + (skip_pregap ? t.pregap : 0)), tFrame = (Bit32u)(tStart + t.inzeros / data_size), tFrameEnd = (Bit32u)(tStart + (t.inzeros + tsize + data_size - 1) / data_size);
 					if (Bit32u tZeroOfs = (t.inzeros % data_size))
 					{
 						Bit8u *pTrgUntil = pTrg + read_size - tZeroOfs, *pTrgLimit = ZIP_MIN(pTrgUntil, pTrgEnd);
@@ -1434,22 +1458,16 @@ struct SFileIso : SFile
 						Bit8u *pTrgUntil = pTrg + read_size, *pTrgLimit = ZIP_MIN(pTrgUntil, pTrgEnd);
 						memcpy(pTrg, ReadSector(tFrame++, raw), (pTrgLimit - pTrg));
 					}
-					Bit8u tSha1[20], chdTrackSha1b[20];
-					SHA1_CTX::Run(&buf[0], buf.size(), tSha1);
-					if (!hextouint8(chdTrackSha1, chdTrackSha1b, 20) || memcmp(chdTrackSha1b, tSha1, 20)) continue;
 				}
 
-				if (!pBT)
-				{
-					pBT = new BuiltTrack;
-					if (number > (int)builtTracks->size()) builtTracks->resize(number);
-					builtTracks->operator[](number - 1) = pBT;
-					pBT->buf.swap(tmpbuf);
-				}
-				pBT->data_size = data_size;
-				pBT->pregap = pregap;
-				pBT->omitted_pregap = omitted_pregap;
-				sprintf(pBT->ttype, "%.*s", ZIP_MIN((int)(ttypeX - ttype), (int)15), ttype);
+				Bit8u tSha1[20], needSha1b[20];
+				SHA1_CTX::Run(bt_buf, bt_buf_size, tSha1);
+				if (!hextouint8(needSha1, needSha1b, 20) || memcmp(needSha1b, tSha1, 20)) continue;
+
+				if (!*outBuiltTrack) *outBuiltTrack = new BuiltTrack;
+				(*outBuiltTrack)->buf = bt_buf;
+				(*outBuiltTrack)->bufsize = bt_buf_size;
+				(*outBuiltTrack)->data_size = data_size;
 				return true;
 			}
 			return false;
@@ -1688,7 +1706,7 @@ struct SFileIso : SFile
 
 		~IsoWriter() { free(chdbuf); }
 
-		virtual void WriteFile(const char* innerpath, size_t innerpath_len, Bit16u wdate, Bit16u wtime, SFile* fsrc, bool keep_already_compressed)
+		virtual void WriteFile(const char* innerpath, size_t innerpath_len, Bit16u wdate, Bit16u wtime, SFile* fsrc, bool)
 		{
 			filequeue.push_back({innerpath, innerpath + innerpath_len, wdate, wtime, fsrc});
 		}
@@ -2082,7 +2100,7 @@ struct SFileIso : SFile
 		Bit32u totalunits = 0;
 		for (BuiltTrack* bt : builtTracks)
 		{
-			totalunits += (Bit32u)(bt->buf.size() / bt->data_size);
+			totalunits += (Bit32u)(bt->bufsize / bt->data_size);
 			totalunits = (totalunits + (CHD_CD_TRACK_PADDING - 1)) / CHD_CD_TRACK_PADDING * CHD_CD_TRACK_PADDING;
 		}
 		const Bit32u totalunmappedhunks = (totalunits + 7) / 8;
@@ -2102,7 +2120,7 @@ struct SFileIso : SFile
 		for (BuiltTrack* bt : builtTracks)
 		{
 			int len = sprintf((char*)meta + CHD_METADATA_HEADER_SIZE, "TRACK:%d TYPE:%s SUBTYPE:%s FRAMES:%d PREGAP:%d PGTYPE:%s%s PGSUB:%s POSTGAP:%d",
-				tnum++, bt->ttype, "NONE", (int)(bt->buf.size() / bt->data_size), (bt->pregap ? bt->pregap : bt->omitted_pregap), (bt->pregap ? "V" : ""), (bt->pregap ? bt->ttype : "MODE1"), "NONE", 0);
+				tnum++, bt->ttype, "NONE", (int)(bt->bufsize / bt->data_size), (bt->pregap ? bt->pregap : bt->omitted_pregap), (bt->pregap ? "V" : ""), (bt->pregap ? bt->ttype : "MODE1"), "NONE", 0);
 
 			Bit8u* metanext = meta + CHD_METADATA_HEADER_SIZE + len + 1;
 			ZIP_WRITE_BE32(&meta[0], CHD_CDROM_TRACK_METADATA2_TAG);
@@ -2148,9 +2166,9 @@ struct SFileIso : SFile
 		totalunits = 0;
 		for (BuiltTrack* bt : builtTracks)
 		{
-			const Bit32u btdsize = (Bit32u)bt->data_size, btunits = (Bit32u)(bt->buf.size() / btdsize);
+			const Bit32u btdsize = (Bit32u)bt->data_size, btunits = (Bit32u)(bt->bufsize / btdsize);
 			const bool btaudio = !memcmp(bt->ttype, "AUDIO", 6);
-			for (Bit8u *p = &bt->buf[0], *pEnd = p + btdsize * btunits, clear = 8; p != pEnd; p += btdsize)
+			for (Bit8u *p = bt->buf, *pEnd = p + btdsize * btunits, clear = 8; p != pEnd; p += btdsize)
 			{
 				memcpy(hnk, p, btdsize);
 				if (clear) { memset(hnk + btdsize, 0, (CHD_UNITBYTES - btdsize)); clear--; }
@@ -2200,8 +2218,9 @@ struct SFileIso : SFile
 		return NULL;
 	}
 
-	static bool TestOrBuildCHD(const std::vector<SFile*>& files, char* pCHDRomOpenTagEnd, Bit64u chdRomSize, const char* chdRomSha1, std::vector<BuiltTrack*>* builtTracks, SFile** builtFile)
+	static bool TestOrBuildCHD(const std::vector<SFile*>& files, char* pCHDRomOpenTagEnd, Bit64u chdRomSize, const char* chdRomSha1 = NULL, SFile** builtFile = NULL)
 	{
+		std::vector<BuiltTrack*> builtTracks;
 		SFileIso::IsoReader* lastReader = NULL;
 		for (SFile* fil : files)
 		{
@@ -2209,37 +2228,251 @@ struct SFileIso : SFile
 			lastReader = &((SFileIso*)fil)->reader;
 
 			EXml x;
-			for (char *pT = pCHDRomOpenTagEnd, *pTEnd = pT; pT && (x = XMLParse(pT, pTEnd)) != XML_END && x != XML_ELEM_END; pT = pTEnd = XMLLevel(pTEnd, x))
+			for (char *p = pCHDRomOpenTagEnd, *pEnd; p && (x = XMLParse(p, pEnd)) != XML_END && x != XML_ELEM_END; p = XMLLevel(pEnd, x))
 			{
-				char *trackNumber, *trackNumberX, *trackType, *trackTypeX, *trackFrames, *trackFramesX, *trackPregap, *trackPregapX, *trackOmittedPregap, *trackOmittedPregapX, *trackSize, *trackSizeX, *trackSha1, *trackSha1X, *trackInZeros, *trackInZerosX, *trackOutZeros, *trackOutZerosX;
-				if (!XMLMatchTag(pT, pTEnd, "track", 5, "number", &trackNumber, &trackNumberX, "type", &trackType, &trackTypeX, "frames", &trackFrames, &trackFramesX, "pregap", &trackPregap, &trackPregapX, "omitted_pregap", &trackOmittedPregap, &trackOmittedPregapX, "size", &trackSize, &trackSizeX, "sha1", &trackSha1, &trackSha1X, "in_zeros", &trackInZeros, &trackInZerosX, "out_zeros", &trackOutZeros, &trackOutZerosX, NULL)) continue;
-				Bit64u tSize = atoi64(trackSize), tFrames = atoi64(trackFrames);
-				if (!tFrames || (tSize % tFrames)) { ZIP_ASSERT(false); continue; }
-				int tNum = atoi(trackNumber), tDataSize = (int)(tSize / tFrames), tPregap = (trackPregap ? atoi(trackPregap) : 0), tOmittedPregap = (trackOmittedPregap ? atoi(trackOmittedPregap) : 0), tInZeros = (trackInZeros ? atoi(trackInZeros) : -1), tOutZeros = (trackOutZeros ? atoi(trackOutZeros) : -1);
-				bool res = lastReader->TestOrFillTrackBuf(builtTracks, tNum, (int)tFrames, tDataSize, trackType, trackTypeX, tPregap, tOmittedPregap, tInZeros, tOutZeros, trackSha1);
-				if (!builtTracks) { if (res) return true; break; } // only test track 1
+				char *tnumber, *ttype, *ttypeX, *tframes, *tpregap, *tomitted_pregap, *tsize, *tsha1, *tsha1X, *tin_zeros, *tout_zeros;
+				if (!XMLMatchTag(p, pEnd, "track", 5, "number", &tnumber, NULL, "type", &ttype, &ttypeX, "frames", &tframes, NULL, "pregap", &tpregap, NULL, "omitted_pregap", &tomitted_pregap, NULL, "size", &tsize, NULL, "sha1", &tsha1, &tsha1X, "in_zeros", &tin_zeros, NULL, "out_zeros", &tout_zeros, NULL, NULL)) continue;
+				const char *missField = (!tnumber ? "number" : !ttype ? "type" : !tframes ? "frames" : !tsize ? "size" : (!tsha1 || (tsha1X - tsha1) != 40) ? "sha1" : NULL);
+				if (missField) { LogErr("<%s> element missing '%s' field!\n", "track", missField); continue; }
+
+				Bit64u size = atoi64(tsize), frames = atoi64(tframes); int num = atoi(tnumber);
+				if (!frames || (size % frames) || num <= 0 || num > 255) { ZIP_ASSERT(false); continue; }
+				int data_size = (int)(size / frames), pregap = (tpregap ? atoi(tpregap) : 0), omitted_pregap = (tomitted_pregap ? atoi(tomitted_pregap) : 0), in_zeros = (tin_zeros ? atoi(tin_zeros) : -1), out_zeros = (tout_zeros ? atoi(tout_zeros) : -1);
+				if (num == 1 && in_zeros == 1 && out_zeros == 0) in_zeros = out_zeros = -1; // ignore zeros on data tracks
+
+				BuiltTrack* pBT = ((builtFile && (int)builtTracks.size() >= num) ? builtTracks[num - 1] : NULL);
+				bool res = lastReader->TestOrFillTrackBuf((builtFile ? &pBT : NULL), (int)frames, data_size, in_zeros, out_zeros, (omitted_pregap > 0), tsha1);
+				if (!builtFile) { if (res) return true; break; } // only test track 1
+				if (res)
+				{
+					pBT->pregap = pregap;
+					pBT->omitted_pregap = omitted_pregap;
+					sprintf(pBT->ttype, "%.*s", ZIP_MIN((int)(ttypeX - ttype), (int)15), ttype);
+					if (num > (int)builtTracks.size()) builtTracks.resize(num);
+					builtTracks[num - 1] = pBT;
+				}
 			}
-			if (builtTracks && builtTracks->size() && (*builtFile = BuildCHDFromTracks(*builtTracks, chdRomSize, chdRomSha1)) != NULL)
+			if (builtFile && builtTracks.size() && (*builtFile = BuildCHDFromTracks(builtTracks, chdRomSize, chdRomSha1)) != NULL)
 			{
 				(*builtFile)->path.assign(lastReader->src.path).append("|AS_CHD");
 				break;
 			}
 		}
-		if (builtTracks) for (BuiltTrack* bt : *builtTracks) delete bt;
+		for (BuiltTrack* bt : builtTracks) delete bt;
 		return false;
 	}
 
 	static SFile* BuildCHD(const std::vector<SFile*>& files, char* pCHDRomOpenTagEnd, Bit64u chdRomSize, const char* chdRomSha1)
 	{
-		std::vector<BuiltTrack*> builtTracks;
 		SFile* builtFile = NULL;
-		TestOrBuildCHD(files, pCHDRomOpenTagEnd, chdRomSize, chdRomSha1, &builtTracks, &builtFile);
+		TestOrBuildCHD(files, pCHDRomOpenTagEnd, chdRomSize, chdRomSha1, &builtFile);
 		return builtFile;
 	}
 
 	static bool CanPotentiallyBuildCHD(const std::vector<SFile*>& files, char* pCHDRomOpenTagEnd, Bit64u chdRomSize)
 	{
-		return TestOrBuildCHD(files, pCHDRomOpenTagEnd, chdRomSize, NULL, NULL, NULL);
+		return TestOrBuildCHD(files, pCHDRomOpenTagEnd, chdRomSize);
+	}
+
+	static SFile* BuildBINOGGFromTrack(BuiltTrack& builtTrack, Bit64u romSize, const char* romSha1, int quality, const char* sourceSha1)
+	{
+		if (romSize == builtTrack.bufsize && (!sourceSha1 || sourceSha1 == romSha1 || !strncasecmp(romSha1, sourceSha1, 40)))
+		{
+			SFileMemory* res = new SFileMemory(0);
+			res->buf = builtTrack.buf;
+			res->size = romSize;
+			builtTrack.buf = NULL; // don't free
+			return res;
+		}
+
+		typedef Bit32u (*fnEncodeVorbisFeedSamples)(float* bufL, float* bufR, Bit32u num, void* user_data);
+		typedef void (*fnEncodeVorbisOutput)(const void* data, Bit32u len, void* user_data);
+		extern void WasmEncodeVorbis(int quality, fnEncodeVorbisFeedSamples feed, fnEncodeVorbisOutput outpt, void* user_data);
+
+		// Very simple test if the OGG encoding produces the expected bits
+		struct TestEncode
+		{
+			enum { TEST_LEN = 5000, TEST_EXPECT_CRC = 0x79d89c91 };
+			float buf[TEST_LEN], *bufp; Bit32u crc;
+			static Bit32u FeedSamples(float* bufL, float* bufR, Bit32u num, TestEncode* self)
+			{
+				Bit32u remain = (Bit32u)(self->buf + TEST_LEN - self->bufp);
+				if (remain < num) num = remain;
+				memcpy(bufL, self->bufp, num*4); memcpy(bufR, self->bufp, num*4);
+				self->bufp += num;
+				return num;
+			}
+			static void OggOutput(const void* data, Bit32u len, TestEncode* self) { self->crc ^= CRC32(data, len); }
+		} *testenc = (TestEncode*)malloc(sizeof(TestEncode));
+
+		for (float *bufp = testenc->buf, *bufpend = bufp + TestEncode::TEST_LEN, seed = 0; bufp != bufpend; bufp++)
+			*bufp = (seed += (seed > 1 ? -1 : 0.000188019f*(bufpend-bufp)));
+		testenc->bufp = testenc->buf;
+		testenc->crc = 0;
+		WasmEncodeVorbis(5, (fnEncodeVorbisFeedSamples)TestEncode::FeedSamples, (fnEncodeVorbisOutput)TestEncode::OggOutput, testenc);
+		Bit32u testrescrc = testenc->crc;
+		free(testenc);
+		if (testrescrc != TestEncode::TEST_EXPECT_CRC)
+		{
+			LogErr("  Tried to encode an audio track to OGG but this system failed to produce the expected encoding results.\n");
+			LogErr("  Expected result: 0x%08x - Test result: 0x%08x - Please report this as a bug at https://github.com/schellingb/DoDAT\n\n\n", TestEncode::TEST_EXPECT_CRC, testrescrc);
+			return NULL;
+		}
+
+		struct Encode
+		{
+			size_t wavpcmlen, wavpcmpos, romcap, romlen;
+			Bit8u *wavpcm, *rombuf;
+
+			static Bit32u FeedSamples(float* bufL, float* bufR, Bit32u num, Encode* self)
+			{
+				Bit32u remain = (Bit32u)((self->wavpcmlen - self->wavpcmpos) / 4);
+				if (remain < num) num = remain;
+				signed char* pcm = (signed char*)(self->wavpcm + self->wavpcmpos);
+				for (Bit32u i = 0; i != num; i++, pcm += 4)
+				{
+					bufL[i] = ((pcm[1] << 8) | (0x00ff & (int)pcm[0])) / 32768.f;
+					bufR[i] = ((pcm[3] << 8) | (0x00ff & (int)pcm[2])) / 32768.f;
+				}
+				if (!self->wavpcmpos && self->wavpcmlen >= 1024*1024) { Log("  Encoding CD audio track to OGG: 0%%"); fflush(stderr); }
+				self->wavpcmpos += num * 4;
+				if ((self->wavpcmpos / (1024*1024)) != ((self->wavpcmpos - (num * 4)) / (1024*1024))) { Log(" .. %u%%", (Bit32u)(((Bit64u)self->wavpcmpos * 100 + 50) / self->wavpcmlen)); fflush(stderr); }
+				if (self->wavpcmpos == self->wavpcmlen && self->wavpcmlen >= 1024*1024 && num) Log("\n");
+				return num;
+			}
+			static void OggOutput(const void* data, Bit32u len, Encode* self)
+			{
+				while (self->romlen + len > self->romcap) self->rombuf = (Bit8u*)realloc(self->rombuf, (self->romcap += 1024*1024));
+				memcpy(self->rombuf + self->romlen, data, len);
+				self->romlen += len;
+			}
+		} enc = {0};
+		enc.wavpcm = builtTrack.buf;
+		enc.wavpcmlen = builtTrack.bufsize;
+
+		WasmEncodeVorbis(quality, (fnEncodeVorbisFeedSamples)Encode::FeedSamples, (fnEncodeVorbisOutput)Encode::OggOutput, &enc);
+
+		Bit8u oggSha1b[20], romSha1b[20];
+		SHA1_CTX::Run(enc.rombuf, enc.romlen, oggSha1b);
+		if (!hextouint8(romSha1, romSha1b, 20) || memcmp(romSha1b, oggSha1b, 20)) { free(enc.rombuf); return NULL; }
+
+		SFileMemory* res = new SFileMemory(0);
+		res->buf = enc.rombuf;
+		res->size = enc.romlen;
+		return res;
+	}
+
+	static bool TestOrBuildBINOGG(const std::vector<SFile*>& files, char* pRomOpenTagEnd, Bit64u romSize, const char* romSha1 = NULL, SFile** builtFile = NULL)
+	{
+		char *p = pRomOpenTagEnd, *pEnd, *stype, *stypeX, *sframes, *somitted_pregap, *ssize, *ssha1, *sin_zeros, *sout_zeros, *squality;
+		if (XMLParse(p, pEnd) == XML_END || !XMLMatchTag(p, pEnd, "source", 6, "type", &stype, &stypeX, "frames", &sframes, NULL, "omitted_pregap", &somitted_pregap, NULL, "size", &ssize, NULL, "sha1", &ssha1, NULL, "in_zeros", &sin_zeros, NULL, "out_zeros", &sout_zeros, NULL, "quality", &squality, NULL, NULL)) return false;
+		const char *missField = (!stype ? "type" : !sframes ? "frames" : NULL);
+		if (missField) { LogErr("<%s> element missing '%s' field!\n", "source", missField); return false; }
+		Bit64u size = (ssize ? atoi64(ssize) : romSize), frames = atoi64(sframes);
+		if (!frames || (size % frames)) { ZIP_ASSERT(false); return false; }
+		int data_size = (int)(size / frames), omitted_pregap = (somitted_pregap ? atoi(somitted_pregap) : 0), in_zeros = (sin_zeros ? atoi(sin_zeros) : -1), out_zeros = (sout_zeros ? atoi(sout_zeros) : -1);
+
+		SFileIso::IsoReader* lastReader = NULL;
+		for (SFile* fil : files)
+		{
+			if (fil->typ != SFile::T_ISO || lastReader == &((SFileIso*)fil)->reader) continue;
+			lastReader = &((SFileIso*)fil)->reader;
+
+			BuiltTrack* pBT = NULL;
+			if (!lastReader->TestOrFillTrackBuf((builtFile ? &pBT : NULL), (int)frames, data_size, in_zeros, out_zeros, (omitted_pregap > 0), (ssha1 ? ssha1 : romSha1))) continue;
+			if (!builtFile) return true; // potential match
+			*builtFile = BuildBINOGGFromTrack(*pBT, romSize, romSha1, (squality ? atoi(squality) : 8), ssha1);
+			delete pBT;
+			if (*builtFile) { (*builtFile)->path.assign(lastReader->src.path).append("|TRACK"); return true; }
+		}
+		return false;
+	}
+
+	static SFile* BuildBINOGG(const std::vector<SFile*>& files, char* pRomOpenTagEnd, Bit64u romSize, const char* romSha1)
+	{
+		SFile* builtFile = NULL;
+		TestOrBuildBINOGG(files, pRomOpenTagEnd, romSize, romSha1, &builtFile);
+		return builtFile;
+	}
+
+	static bool CanPotentiallyBuildBINOGG(const std::vector<SFile*>& files, char* pRomOpenTagEnd, Bit64u romSize)
+	{
+		return TestOrBuildBINOGG(files, pRomOpenTagEnd, romSize);
+	}
+
+	static SFile* BuildCUE(char* cueName, char* cueNameX, char* pGameInner, Bit64u needCueSize, const char* needCueSha1)
+	{
+		size_t baseLen = (size_t)(cueNameX - cueName - 4), pathDirLen = baseLen, builtCueLen = 0;
+		for (;pathDirLen > 0; pathDirLen--) { if (cueName[pathDirLen-1] == '/' || cueName[pathDirLen-1] == '\\') break; }
+
+		EXml x;
+		std::vector<std::vector<char>> cueTracks;
+		for (char* p = pGameInner, *pEnd, *pNext; p && (x = XMLParse(p, pEnd)) != XML_END && x != XML_ELEM_END && (pNext = XMLLevel(pEnd, x)) != NULL; p = pNext)
+		{
+			char *romName, *romNameX, *romSize;
+			if (!XMLMatchTag(p, pEnd, "rom", 3, "name", &romName, &romNameX, "size", &romSize, NULL, NULL)) continue;
+			XMLInlineStringConvert(romName, romNameX);
+
+			// Rom name needs to match everything up to the extension and then have a track number after (i.e. "GAME.cue" finds "GAME (Track 1).bin")
+			size_t romLen = (size_t)(romNameX - romName);
+			if (romLen < (baseLen + 12) || strncasecmp(cueName, romName, baseLen) || romName[baseLen] == '.') continue;
+			char *romBracket = (char*)memchr(romName + baseLen, '(', romLen - baseLen), *romTrackNo = (romBracket ? (char*)memchr(romBracket, ' ', (size_t)(romNameX - romBracket)) : NULL);
+			int trackNo = (romTrackNo ? atoi(romTrackNo) : 0);
+			if (trackNo < 1 || trackNo > 200) continue;
+
+			char *pSrc = pEnd, *stype = NULL, *sframes = NULL, *spregap = NULL, *somitted_pregap = NULL, *ssize = NULL;
+			if (XMLParse(pSrc, pEnd) != XML_END) XMLMatchTag(pSrc, pEnd, "source", 6, "type", &stype, NULL, "frames", &sframes, NULL, "pregap", &spregap, NULL, "omitted_pregap", &somitted_pregap, NULL, "size", &ssize, NULL, NULL);
+			Bit64u size = (ssize ? atoi64(ssize) : atoi64(romSize));
+			int data_size = (sframes ? (int)(size / atoi64(sframes)) : !(size % 2352) ? 2352 : !(size % 2048) ? 2048 : 2336);
+			int pregap = (spregap ? atoi(spregap) : 0), omitted_pregap = (somitted_pregap ? atoi(somitted_pregap) : 0);
+
+			if (cueTracks.size() < (size_t)trackNo) cueTracks.resize((size_t)trackNo);
+			std::vector<char> &cueTrack = cueTracks[trackNo-1];
+
+			const char* ttype = (stype ? (const char*)stype : (trackNo > 1 ? "AUDIO" : "MODE1"));
+			const bool isAudio = !strncasecmp(ttype, "AUDIO", 5);
+
+			cueTrack.resize(160 + (romLen - pathDirLen));
+			char *pcue = &cueTrack[0], binTrackType[16];
+			sprintf(binTrackType, (isAudio ? "AUDIO" : "MODE%c/%04d"), ttype[4], (int)data_size);
+			pcue += sprintf(pcue, "FILE \"%.*s\" %s\r\n", (int)(romLen - pathDirLen), (romName + pathDirLen), (isAudio ? "MP3" : "BINARY"));
+			pcue += sprintf(pcue, "  TRACK %02d %s\r\n", trackNo, binTrackType);
+			if (!pregap && !omitted_pregap)
+			{
+				// Data or audio track without pregap
+				pcue += sprintf(pcue, "    INDEX 01 00:00:00\r\n");
+			}
+			else if (pregap)
+			{
+				// Data or audio track with included pregap use a pair of INDEX 00 and INDEX 01 tags
+				pcue += sprintf(pcue, "    INDEX 00 00:00:00\r\n");
+				pcue += sprintf(pcue, "    INDEX 01 %02d:%02d:%02d\r\n", (pregap/(60*75))%60, (pregap/75)%60, pregap%75);
+			}
+			else
+			{
+				// Data or audio track with omitted pregap use PREGAP and INDEX 01 tags
+				pcue += sprintf(pcue, "    PREGAP %02d:%02d:%02d\r\n", (omitted_pregap/(60*75))%60, (omitted_pregap/75)%60, omitted_pregap%75);
+				pcue += sprintf(pcue, "    INDEX 01 00:00:00\r\n");
+			}
+			cueTrack.resize((size_t)(pcue - &cueTrack[0]));
+			if ((builtCueLen += cueTrack.size()) >= needCueSize) break;
+		}
+		if (builtCueLen != needCueSize) return NULL;
+
+		SFileMemory* res = new SFileMemory(builtCueLen);
+		Bit8u *pout = res->buf;
+		for (std::vector<char> &cueTrack : cueTracks)
+		{
+			if (!cueTrack.size()) continue;
+			memcpy(pout, &cueTrack[0], cueTrack.size());
+			pout += cueTrack.size();
+		}
+
+		Bit8u builtCueSha1b[20], needCueSha1b[20];
+		SHA1_CTX::Run(res->buf, (size_t)res->size, builtCueSha1b);
+		if (!hextouint8(needCueSha1, needCueSha1b, 20) || memcmp(needCueSha1b, builtCueSha1b, 20)) { delete res; return NULL; }
+		res->path.assign(cueName, (size_t)(cueNameX - cueName)).append("|GENERATED");
+		return res;
 	}
 };
 
@@ -2594,39 +2827,21 @@ static bool VerifyGame(char* pGameInner, char* gameName, char* gameNameX, const 
 
 static bool BuildRom(char* pGameInner, char* gameName, char* gameNameX, const std::string& outBase, std::string& workPath, const std::vector<SFile*>& files, bool isFix = false, bool forceTry = false, bool useSrcDates = false, bool logPartialMatch = true, bool verifyExisting = true, char** pGameEn = NULL)
 {
-	Bit32u needRoms = 0, haveSizeMatches = 0; Bit64u testForCHDWithSize = (Bit64u)-1;
-	char* p, *pEnd, *pNext, *textStart, *textEnd, *testForCHD = NULL;
+	Bit32u needRoms = 0, haveSizeMatches = 0, generatable = 0;
+	char* p, *pEnd, *pNext, *textStart, *textEnd;
 	EXml x;
 	for (p = pGameInner; p && (x = XMLParse(p, pEnd)) != XML_END && x != XML_ELEM_END && (pNext = XMLLevel(pEnd, x)) != NULL; p = pNext)
 	{
-		char *romName, *romNameX, *romSize, *romSizeX, *romCrc, *romCrcX, *romSha1, *romSha1X, *romData, *romDataX;
-		if (!XMLMatchTag(p, pEnd, "rom", 3, "name", &romName, &romNameX, "size", &romSize, &romSizeX, "crc", &romCrc, &romCrcX, "sha1", &romSha1, &romSha1X, "data", &romData, &romDataX, NULL)) continue;
+		char *romName, *romNameX, *romSize, *romCrc, *romSha1, *romSha1X, *romData;
+		if (!XMLMatchTag(p, pEnd, "rom", 3, "name", &romName, &romNameX, "size", &romSize, NULL, "crc", &romCrc, NULL, "sha1", &romSha1, &romSha1X, "data", &romData, NULL, NULL)) continue;
 
 		const char *missField = (!romName ? "name" : !romSize ? "size" : !romCrc ? "crc" : (!romSha1 || (romSha1X - romSha1) != 40) ? "sha1" : NULL);
 		if (missField) { char ce = *pEnd; *pEnd = '\0'; if (!strstr(p, "status=\"nodump\"")) LogErr("<%s> element missing '%s' field!\n", "rom", missField); *pEnd = ce; haveSizeMatches = 0; break; }
 		Bit64u size = atoi64(romSize);
 		needRoms++;
-		if (size < 7 || romData) goto potentialMatch; // can auto generate
+		if (size < 7 || size == 43008 || romData) goto potentialMatch; // can auto generate
 		for (SFile* fil : files) if (fil->size == size) goto potentialMatch;
-		if (size == 43008 && !strncasecmp(romSha1, "8a2846aac1e2ceb8a08a9cd5591e9a85228d5cab", 40)) goto potentialMatch; // known file
-		if (x == XML_ELEM_START && !testForCHD)
-		{
-			while (*pEnd && *pEnd != '<') { pEnd++; } if (!*pEnd) break; // skip whitespace to first child tag
-			if (pEnd[1] == 't') { testForCHD = pEnd; testForCHDWithSize = size; goto potentialMatch; } // <track> tag
-			if (pEnd[1] == 'p' && needRoms == haveSizeMatches + 1) // <patch> tag
-			{
-				char *pNextPatch, *patchData, *patchDataX, *patchSize, *patchSizeX, *patchCrc, *patchCrcX, *patchSha1, *patchSha1X;
-				for (p = pEnd; p && (x = XMLParse(p, pEnd)) != XML_END && x != XML_ELEM_END && (pNextPatch = XMLLevel(pEnd, x)) != NULL; p = pNextPatch)
-				{
-					if (!XMLMatchTag(p, pEnd, "patch", 5, "data", &patchData, &patchDataX, "size", &patchSize, &patchSizeX, "crc", &patchCrc, &patchCrcX, "sha1", &patchSha1, &patchSha1X, NULL)) continue;
-
-					missField = (!patchData ? "data" : !patchSize ? "size" : !patchCrc ? "crc" : (!patchSha1 || (patchSha1X - patchSha1) != 40) ? "sha1" : NULL);
-					if (missField) { LogErr("<%s> element missing '%s' field!\n", "patch", missField); break; }
-					size = atoi64(patchSize);
-					for (SFile* fil : files) if (fil->size == size) goto potentialMatch;
-				}
-			}
-		}
+		if (x == XML_ELEM_START) generatable++;
 		continue;
 		potentialMatch:
 		haveSizeMatches++;
@@ -2634,8 +2849,29 @@ static bool BuildRom(char* pGameInner, char* gameName, char* gameNameX, const st
 	if (p != pGameInner && pGameEn) *pGameEn = p;
 	if (!forceTry)
 	{
-		if (!needRoms || haveSizeMatches < (1 + needRoms * 2 / 3)) return false;
-		if (testForCHD && !SFileIso::CanPotentiallyBuildCHD(files, testForCHD, testForCHDWithSize)) return false;
+		if (!needRoms || (haveSizeMatches + generatable) < (1 + needRoms * 2 / 3)) return false;
+		if (generatable)
+		{
+			for (p = pGameInner; p && (x = XMLParse(p, pEnd)) != XML_END && x != XML_ELEM_END && (pNext = XMLLevel(pEnd, x)) != NULL; p = pNext)
+			{
+				char *romSize;
+				if (x != XML_ELEM_START || !XMLMatchTag(p, pEnd, "rom", 3, "size", &romSize, NULL, NULL)) continue;
+				while (*pEnd && *pEnd != '<') { pEnd++; } if (!*pEnd) break; // skip whitespace to first child tag
+				if (pEnd[1] == 't') // <track> tag
+				{
+					if (SFileIso::CanPotentiallyBuildCHD(files, pEnd, atoi64(romSize))) haveSizeMatches++;
+				}
+				else if (pEnd[1] == 'p') // <patch> tag
+				{
+					if (SFileMemory::CanPotentiallyBuildPatched(files, pEnd)) haveSizeMatches++;
+				}
+				else if (pEnd[1] == 's') // <source> tag
+				{
+					if (SFileIso::CanPotentiallyBuildBINOGG(files, pEnd, atoi64(romSize))) haveSizeMatches += 2; // count as 2 to include potential for .CUE to be generated
+				}
+			}
+			if (haveSizeMatches < (1 + needRoms * 2 / 3)) return false;
+		}
 	}
 
 	XMLInlineStringConvert(gameName, gameNameX);
@@ -2660,8 +2896,8 @@ static bool BuildRom(char* pGameInner, char* gameName, char* gameNameX, const st
 	bool closeInfoSection = false;
 	for (r = 0, p = pGameInner; p && (x = XMLParse(p, pEnd)) != XML_END && x != XML_ELEM_END && (pNext = XMLLevel(pEnd, x, &textStart, &textEnd)) != NULL; p = pNext)
 	{
-		char *romName, *romNameX, *romSize, *romSizeX, *romCrc, *romCrcX, *romSha1, *romSha1X, *romData, *romDataX;
-		if (!XMLMatchTag(p, pEnd, "rom", 3, "name", &romName, &romNameX, "size", &romSize, &romSizeX, "crc", &romCrc, &romCrcX, "sha1", &romSha1, &romSha1X, "data", &romData, &romDataX, NULL))
+		char *romName, *romNameX, *romSize, *romCrc, *romSha1, *romData, *romDataX;
+		if (!XMLMatchTag(p, pEnd, "rom", 3, "name", &romName, &romNameX, "size", &romSize, NULL, "crc", &romCrc, NULL, "sha1", &romSha1, NULL, "data", &romData, &romDataX, NULL))
 		{
 			char *linkType, *linkTypeX;
 			if (forceTry && !isFix && (XMLMatchTag(p, pEnd, "link", 4, "type", &linkType, &linkTypeX, NULL) || XMLMatchTag(p, pEnd, "comment", 7, NULL)))
@@ -2700,7 +2936,7 @@ static bool BuildRom(char* pGameInner, char* gameName, char* gameNameX, const st
 			break;
 		}
 
-		if (!romFile)
+		if (!romFile && matches == r - 1) // attempt to generate files if everything else so far has matched
 		{
 			Bit8u romSha1b[20], verify = 0;
 			static const unsigned char emptyDataBinComp[] = "\355\331\305A\4\61\0\5\320\37.#7\354\214T0\324\0\5\320\177\61\254\260\356\212\356{\23\237\344\32\r\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\204\362\372\326u/%\217'\312\330\375$\333\241\f\302\60\246\256\323\346S{\223\251\333\f<\347.\237\356Rg\240\316{>]M\306?~\37\350\226\344\210\206\22\200_\241\67^\377\1\200\313Qr\367\231\2\0\227\243d\340n\224\1\0\27a\367\33\373\356\36%\0\300\237\322\7";
@@ -2712,10 +2948,14 @@ static bool BuildRom(char* pGameInner, char* gameName, char* gameNameX, const st
 			else if (romData && (romFile = new SFileMemory(romData, (size_t)(romDataX - romData))) != NULL) verify = 1;
 			// See if this is the known embedded empty data bin file
 			else if (size == 43008 && !strncasecmp(romSha1, "8a2846aac1e2ceb8a08a9cd5591e9a85228d5cab", 40) && (romFile = SFileZip::BuildDeflated(emptyDataBinComp, emptyDataBinCompSize, emptyDataBinSize)) != NULL) {}
+			// See if this is a file we perhaps can build with an embedded patch
+			else if (x == XML_ELEM_START && (romFile = SFileMemory::BuildPatched(files, pEnd, size, romSha1)) != NULL) {}
 			// See if this is a CHD image we perhaps can build out of ISO/CUE/BIN file(s)
-			else if (x == XML_ELEM_START && matches == r - 1 && (romFile = SFileIso::BuildCHD(files, pEnd, size, romSha1)) != NULL) {}
-			// See if this is a CHD image we perhaps can build out of ISO/CUE/BIN file(s)
-			else if (x == XML_ELEM_START && matches == r - 1 && (romFile = SFileMemory::BuildPatched(files, pEnd, size, romSha1)) != NULL) {}
+			else if (x == XML_ELEM_START && (romFile = SFileIso::BuildCHD(files, pEnd, size, romSha1)) != NULL) {}
+			// See if this is a BIN/OGG file we perhaps can build out of a CHD/ISO/BIN file
+			else if (x == XML_ELEM_START && (romFile = SFileIso::BuildBINOGG(files, pEnd, size, romSha1)) != NULL) {}
+			// See if this is a CUE file we can perhaps generate out of the rom listing
+			else if (!strncasecmp(romNameX - 4, ".CUE", 4)) { XMLInlineStringConvert(romName, romNameX); romFile = SFileIso::BuildCUE(romName, romNameX, pGameInner, size, romSha1); }
 
 			if (romFile) gameFiles.push_back(romFile); // remember to delete during cleanup
 			if (verify && (romFile->size != size || !romFile->GetSHA1() || !hextouint8(romSha1, romSha1b, 20) || memcmp(romFile->sha1, romSha1b, 20))) romFile = NULL;
@@ -2735,8 +2975,8 @@ static bool BuildRom(char* pGameInner, char* gameName, char* gameNameX, const st
 		if (w->failed) LogErr("  ERROR: Could not open output file %s\n\n", outPath);
 		for (r = 0, p = pGameInner; !w->failed && p && (x = XMLParse(p, pEnd)) != XML_END && x != XML_ELEM_END && (pNext = XMLLevel(pEnd, x)) != NULL; p = pNext)
 		{
-			char *romName, *romNameX, *romSize, *romSizeX, *romCrc, *romCrcX, *romSha1, *romSha1X, *romDate, *romDateX;
-			if (!XMLMatchTag(p, pEnd, "rom", 3, "name", &romName, &romNameX, "size", &romSize, &romSizeX, "crc", &romCrc, &romCrcX, "sha1", &romSha1, &romSha1X, "date", &romDate, &romDateX, NULL)) continue;
+			char *romName, *romNameX, *romSize, *romCrc, *romSha1, *romDate, *romDateX;
+			if (!XMLMatchTag(p, pEnd, "rom", 3, "name", &romName, &romNameX, "size", &romSize, NULL, "crc", &romCrc, NULL, "sha1", &romSha1, NULL, "date", &romDate, &romDateX, NULL)) continue;
 
 			SFile* romFile = gameFiles[r++]; //make sure to increment r before continue
 			Bit16u zdate = 0, ztime = 0;
@@ -2793,8 +3033,8 @@ static bool VerifyGame(char* pGameInner, char* gameName, char* gameNameX, const 
 	char* p = pGameInner, *pEnd, *pNext;
 	for (EXml x; p && (x = XMLParse(p, pEnd)) != XML_END && x != XML_ELEM_END && (pNext = XMLLevel(pEnd, x)) != NULL; p = pNext)
 	{
-		char *romName, *romNameX, *romSize, *romSizeX, *romCrc, *romCrcX, *romSha1, *romSha1X, *romDate, *romDateX, *romData, *romDataX;
-		if (!XMLMatchTag(p, pEnd, "rom", 3, "name", &romName, &romNameX, "size", &romSize, &romSizeX, "crc", &romCrc, &romCrcX, "sha1", &romSha1, &romSha1X, "date", &romDate, &romDateX, "data", &romData, &romDataX, NULL)) continue;
+		char *romName, *romNameX, *romSize, *romCrc, *romCrcX, *romSha1, *romSha1X, *romDate, *romDateX, *romData;
+		if (!XMLMatchTag(p, pEnd, "rom", 3, "name", &romName, &romNameX, "size", &romSize, NULL, "crc", &romCrc, &romCrcX, "sha1", &romSha1, &romSha1X, "date", &romDate, &romDateX, "data", &romData, NULL, NULL)) continue;
 
 		const char *missField = (!romName ? "name" : !romSize ? "size" : !romCrc ? "crc" : (!romSha1 || (romSha1X - romSha1) != 40) ? "sha1" : NULL);
 		if (missField) { LogErr("<%s> element missing '%s' field!\n", "rom", missField); break; }

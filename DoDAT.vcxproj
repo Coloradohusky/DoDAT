@@ -97,5 +97,6 @@
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ItemGroup>
     <ClCompile Include="DoDAT.cpp" />
+    <ClCompile Include="WasmEncodeVorbis.cpp" />
   </ItemGroup>
 </Project>
