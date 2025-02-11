@@ -3187,7 +3187,7 @@ int main(int argc, char *argv[])
 			"  -f         : Fix meta data in existing files that fail verification\n"
 			"  -c         : Use fast CRC only check for verification and fixing\n"
 			"  -q         : Don't ask for pressing a key at the end\n"
-			"\n", "DoDAT", "0.6");
+			"\n", "DoDAT", "0.7");
 		return 1;
 	}
 
