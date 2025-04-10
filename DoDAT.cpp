@@ -2400,7 +2400,7 @@ struct SFileIso : SFile
 		return TestOrBuildBINOGG(files, pRomOpenTagEnd, romSize);
 	}
 
-	static SFile* BuildCUE(char* cueName, char* cueNameX, char* pGameInner, Bit64u needCueSize, const char* needCueSha1)
+	static SFile* BuildCUE(char* cueName, char* cueNameX, char* pGameInner, Bit64u needCueSize)
 	{
 		size_t baseLen = (size_t)(cueNameX - cueName - 4), pathDirLen = baseLen, builtCueLen = 0;
 		for (;pathDirLen > 0; pathDirLen--) { if (cueName[pathDirLen-1] == '/' || cueName[pathDirLen-1] == '\\') break; }
@@ -2467,10 +2467,6 @@ struct SFileIso : SFile
 			memcpy(pout, &cueTrack[0], cueTrack.size());
 			pout += cueTrack.size();
 		}
-
-		Bit8u builtCueSha1b[20], needCueSha1b[20];
-		SHA1_CTX::Run(res->buf, (size_t)res->size, builtCueSha1b);
-		if (!hextouint8(needCueSha1, needCueSha1b, 20) || memcmp(needCueSha1b, builtCueSha1b, 20)) { delete res; return NULL; }
 		res->path.assign(cueName, (size_t)(cueNameX - cueName)).append("|GENERATED");
 		return res;
 	}
@@ -2892,6 +2888,7 @@ static bool BuildRom(char* pGameInner, char* gameName, char* gameNameX, const st
 	std::vector<SFile*> gameFiles;
 	gameFiles.resize(needRoms); // all NULL
 
+	// First match files by size and content
 	Bit32u r, matches = 0;
 	bool closeInfoSection = false;
 	for (r = 0, p = pGameInner; p && (x = XMLParse(p, pEnd)) != XML_END && x != XML_ELEM_END && (pNext = XMLLevel(pEnd, x, &textStart, &textEnd)) != NULL; p = pNext)
@@ -2920,6 +2917,7 @@ static bool BuildRom(char* pGameInner, char* gameName, char* gameNameX, const st
 		for (SFile* fi : files)
 		{
 			if (fi->size != size || fi->IsContainedBy(outPath, outPathLen) || fi->GetCRC32() != (Bit32u)atoi64(romCrc, 0x10)) continue;
+			if (!size && (fi->path.back() == '\\' || fi->path.back() == '/')) continue; // don't assign directory to empty files
 			Bit8u romSha1b[20];
 			if (!fi->GetSHA1() || !hextouint8(romSha1, romSha1b, 20) || memcmp(fi->sha1, romSha1b, 20)) continue;
 			if (useSrcDates)
@@ -2935,8 +2933,7 @@ static bool BuildRom(char* pGameInner, char* gameName, char* gameNameX, const st
 			romFile = fi;
 			break;
 		}
-
-		if (!romFile && matches == r - 1) // attempt to generate files if everything else so far has matched
+		if (!romFile) // attempt to generate simple files
 		{
 			Bit8u romSha1b[20], verify = 0;
 			static const unsigned char emptyDataBinComp[] = "\355\331\305A\4\61\0\5\320\37.#7\354\214T0\324\0\5\320\177\61\254\260\356\212\356{\23\237\344\32\r\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\204\362\372\326u/%\217'\312\330\375$\333\241\f\302\60\246\256\323\346S{\223\251\333\f<\347.\237\356Rg\240\316{>]M\306?~\37\350\226\344\210\206\22\200_\241\67^\377\1\200\313Qr\367\231\2\0\227\243d\340n\224\1\0\27a\367\33\373\356\36%\0\300\237\322\7";
@@ -2948,22 +2945,41 @@ static bool BuildRom(char* pGameInner, char* gameName, char* gameNameX, const st
 			else if (romData && (romFile = new SFileMemory(romData, (size_t)(romDataX - romData))) != NULL) verify = 1;
 			// See if this is the known embedded empty data bin file
 			else if (size == 43008 && !strncasecmp(romSha1, "8a2846aac1e2ceb8a08a9cd5591e9a85228d5cab", 40) && (romFile = SFileZip::BuildDeflated(emptyDataBinComp, emptyDataBinCompSize, emptyDataBinSize)) != NULL) {}
-			// See if this is a file we perhaps can build with an embedded patch
-			else if (x == XML_ELEM_START && (romFile = SFileMemory::BuildPatched(files, pEnd, size, romSha1)) != NULL) {}
-			// See if this is a CHD image we perhaps can build out of ISO/CUE/BIN file(s)
-			else if (x == XML_ELEM_START && (romFile = SFileIso::BuildCHD(files, pEnd, size, romSha1)) != NULL) {}
-			// See if this is a BIN/OGG file we perhaps can build out of a CHD/ISO/BIN file
-			else if (x == XML_ELEM_START && (romFile = SFileIso::BuildBINOGG(files, pEnd, size, romSha1)) != NULL) {}
 			// See if this is a CUE file we can perhaps generate out of the rom listing
-			else if (!strncasecmp(romNameX - 4, ".CUE", 4)) { XMLInlineStringConvert(romName, romNameX); romFile = SFileIso::BuildCUE(romName, romNameX, pGameInner, size, romSha1); }
+			else if (!strncasecmp(romNameX - 4, ".CUE", 4) && (romFile = (XMLInlineStringConvert(romName, romNameX), SFileIso::BuildCUE(romName, romNameX, pGameInner, size))) != NULL) verify = 1;
+			// Skip failing this file for now if it might be generatable in the next step (count generatable again, it might have not been counted yet due to matching file size)
+			else if (x == XML_ELEM_START) { generatable++; continue; }
 
 			if (romFile) gameFiles.push_back(romFile); // remember to delete during cleanup
 			if (verify && (romFile->size != size || !romFile->GetSHA1() || !hextouint8(romSha1, romSha1b, 20) || memcmp(romFile->sha1, romSha1b, 20))) romFile = NULL;
 		}
+		if (romFile) { gameFiles[r-1] = romFile; matches++; continue; }
+		if (logPartialMatch) { XMLInlineStringConvert(romName, romNameX); Log("  Failed to find a match for [%.*s]!\n", (int)(romNameX - romName), romName); generatable = 0; }
+	}
 
-		if (romFile || size < 7) { gameFiles[r-1] = romFile; matches++; continue; } // can auto generate size < 7
-		XMLInlineStringConvert(romName, romNameX);
-		if (logPartialMatch) Log("  Failed to find a match for [%.*s]!\n", (int)(romNameX - romName), romName);
+	// If needed, generate files not yet matched
+	for (r = 0, p = pGameInner; matches != needRoms && matches >= r && p && (x = XMLParse(p, pEnd)) != XML_END && x != XML_ELEM_END && (pNext = XMLLevel(pEnd, x, &textStart, &textEnd)) != NULL; p = pNext)
+	{
+		char *romName, *romNameX, *romSize, *romCrc, *romSha1, *romData, *romDataX;
+		if (!XMLMatchTag(p, pEnd, "rom", 3, "name", &romName, &romNameX, "size", &romSize, NULL, "crc", &romCrc, NULL, "sha1", &romSha1, NULL, "data", &romData, &romDataX, NULL)) continue;
+		if (gameFiles[r++] || x != XML_ELEM_START) continue; // make sure to increment r before continue, skip already matched and entries without inner elements in this step
+		Bit64u size = atoi64(romSize);
+		if ((!size && (romNameX[-1] == '/' || romNameX[-1] == '\\')) || size > (Bit64u)0xFFFFFFFF) continue; // directory or invalid size
+		if (!generatable) { if (logPartialMatch) { XMLInlineStringConvert(romName, romNameX); Log("  Have missing files, skip attempt to generate [%.*s]!\n", (int)(romNameX - romName), romName); } continue; }
+		SFile* romFile = NULL;
+
+		// See if this is a file we perhaps can build with an embedded patch
+		if      ((romFile = SFileMemory::BuildPatched(files, pEnd, size, romSha1)) != NULL) {}
+		// See if this is a CHD image we perhaps can build out of ISO/CUE/BIN file(s)
+		else if ((romFile = SFileIso::BuildCHD(files, pEnd, size, romSha1)) != NULL) {}
+		// See if this is a BIN/OGG file we perhaps can build out of a CHD/ISO/BIN file
+		else if ((romFile = SFileIso::BuildBINOGG(files, pEnd, size, romSha1)) != NULL) {}
+		// Give up generating files
+		else generatable = 0;
+
+		if (romFile) gameFiles.push_back(romFile); // remember to delete during cleanup
+		if (romFile) { gameFiles[r-1] = romFile; matches++; continue; }
+		if (logPartialMatch) { XMLInlineStringConvert(romName, romNameX); Log("  Failed to find a match for [%.*s]!\n", (int)(romNameX - romName), romName); }
 	}
 
 	bool res = (matches == needRoms);
@@ -3070,7 +3086,7 @@ static bool VerifyGame(char* pGameInner, char* gameName, char* gameNameX, const 
 			break;
 		}
 
-		if (!matchFile)
+		if (!matchFile && size)
 			for (SFile* fi : gameFiles)
 			{
 				if ((matchSize = (size == fi->size)) == false) continue;
@@ -3110,7 +3126,13 @@ static bool VerifyGame(char* pGameInner, char* gameName, char* gameNameX, const 
 				Log(", need %.*s)\n", (int)(romSha1X - romSha1), romSha1);
 			}
 		}
-		if (!matchSha1 && size >= 7 && (size != 43008 || strncasecmp(romSha1, "8a2846aac1e2ceb8a08a9cd5591e9a85228d5cab", 40)) && !romData) romUnfixable++;
+		if (!matchSha1 && size >= 7 && (size != 43008 || strncasecmp(romSha1, "8a2846aac1e2ceb8a08a9cd5591e9a85228d5cab", 40)) && !romData)
+		{
+			bool unfixable = true;
+			for (SFile* fi : gameFiles)
+				if (size == fi->size && fi->GetCRC32() == (Bit32u)atoi64(romCrc, 0x10) && fi->GetSHA1() && hextouint8(romSha1, romSha1b, 20) && !memcmp(fi->sha1, romSha1b, 20)) { unfixable = false; break; }
+			if (unfixable) romUnfixable++;
+		}
 	}
 	if (p != pGameInner && pGameEn) *pGameEn = p;
 
@@ -3199,16 +3221,17 @@ int main(int argc, char *argv[])
 	if (!useStdin) { fseek_wrap(fXML, 0, SEEK_END); xml.reserve((size_t)ftell_wrap(fXML) + 1); fseek_wrap(fXML, 0, SEEK_SET); }
 
 	char xmlreadbuf[2048];
+	size_t readStep = (useStdin ? 1 : sizeof(xmlreadbuf));
 	for (int rootTagOfs = 0, rootTagLen = 0, got = 0, ofs = 0;;)
 	{
 		if (ofs == got)
 		{
-			got = (int)fread(xmlreadbuf, 1, sizeof(xmlreadbuf), fXML);
+			got = (int)fread(xmlreadbuf, 1, readStep, fXML);
 			ofs = 0;
 			if (got > 0) { if (useStdin) xml.reserve((xml.length()+65535)/32768*32768); xml.append(xmlreadbuf, got); }
 		}
 		int c = (ofs >= got ? 0 : xmlreadbuf[ofs++]);
-		if (c == 0 || c == 23) // 23 is CTRL+W
+		if (c == 0 || c == 4 || c == 23) // 4 is CTRL+D, 23 is CTRL+W
 		{
 			incompleteXml:
 			LogErr("Received incomplete XML\n");
@@ -3234,7 +3257,7 @@ int main(int argc, char *argv[])
 	while (xmlPathEnd != xmlPath && *xmlPathEnd != '/' && *xmlPathEnd != '\\') xmlPathEnd--;
 
 	std::string outBase, workPath;
-	(((outPath || xmlPathEnd == xmlPath) ? outBase.assign(outPath ? outPath : ".") : outBase.assign(xmlPath, (xmlPathEnd - xmlPath))) += '/');
+	((outPath || xmlPathEnd == xmlPath) ? outBase.assign(outPath ? outPath : ".") : outBase.assign(xmlPath, (xmlPathEnd - xmlPath))) += '/';
 
 	if (verifyMode || fixMode)
 	{
@@ -3280,8 +3303,8 @@ int main(int argc, char *argv[])
 		SFileZip::ZipWriter allz(sourcePathTmp.assign(xmlPath).append(".allsources.dosz").c_str());
 		for (SFile* fil : files)
 			if (strncasecmp(fil->path.c_str()+fil->path.length()-4, ".zip", 4) && strncasecmp(fil->path.c_str()+fil->path.length()-5, ".dosz", 5) && strncasecmp(fil->path.c_str()+fil->path.length()-4, ".bin", 4))
-				allz.WriteFile(fil->path.c_str(), false, fil->date, fil->time, fil);
-		allz.Finalize();
+				allz.WriteFile(fil->path.c_str(), fil->path.length(), fil->date, fil->time, fil, false);
+		allz.Finalize(NULL);
 		return 1;
 		#endif
 
