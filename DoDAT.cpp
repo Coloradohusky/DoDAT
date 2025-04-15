@@ -782,7 +782,7 @@ struct SFileZip : SFileMemory
 
 	static bool UsesExtension(const char* ext3, const char* ext4, bool as_output)
 	{
-		return (ext3 && !strncasecmp(ext3, "ZIP", 3)) || (ext4 && (!strncasecmp(ext4, "DOSC", 4) || (as_output && !strncasecmp(ext4, "DOSZ", 4))));
+		return (ext3 && (!strncasecmp(ext3, "ZIP", 3) || !strncasecmp(ext3, "EXE", 3))) || (ext4 && (!strncasecmp(ext4, "DOSC", 4) || (as_output && !strncasecmp(ext4, "DOSZ", 4))));
 	}
 
 	static bool IndexFiles(SFile& fi, std::vector<SFile*>& files)
@@ -791,7 +791,8 @@ struct SFileZip : SFileMemory
 		if (fi.size < ZIP_END_OF_CENTRAL_DIR_HEADER_SIZE)
 		{
 			invalid_zip:
-			LogErr("Invalid or unsupported ZIP file: %s\n", fi.path.c_str());
+			if (fi.path.length() < 3 || (fi.path[fi.path.length()-3] | 0x20) != 'e') // don't log for .exe files
+				LogErr("Invalid or unsupported ZIP file: %s\n", fi.path.c_str());
 			if (fi.size >= ZIP_END_OF_CENTRAL_DIR_HEADER_SIZE) fi.Close();
 			return false;
 		}
