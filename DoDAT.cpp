@@ -379,9 +379,9 @@ static void XMLInlineStringConvert(char* pStart, char*& pEnd)
 
 struct SFile
 {
-	std::string path; Bit64u size; Bit16u date, time; Bit32u crc32; Bit8u sha1[20]; bool have_crc32, have_sha1, was_matched;
+	std::string path; Bit64u size; Bit16u date, time; Bit32u crc32; Bit8u sha1[20]; bool have_crc32, have_sha1, was_matched; SFile* parent;
 	enum : Bit8u { T_RAW, T_MEMORY, T_ZIP, T_ISO, T_FAT } typ;
-	inline SFile() : date(0), time(0), have_crc32(false), have_sha1(false), was_matched(false) { }
+	inline SFile() : date(0), time(0), have_crc32(false), have_sha1(false), was_matched(false), parent(nullptr) { }
 	virtual inline ~SFile() { }
 	virtual bool Open() = 0;
 	virtual bool IsOpen() = 0;
@@ -389,7 +389,15 @@ struct SFile
 	virtual Bit64u Read(Bit8u* data, Bit64u len) = 0;
 	//virtual Bit64u Write(const Bit8u* data, Bit64u len) { return 0; }
 	virtual Bit64u Seek(Bit64s ofs, int origin = SEEK_SET) = 0;
-
+	const std::string GetFullPath() { // combines parent path with file path if needed
+		if (parent != NULL) { // not perfect, todo
+			if (size != parent->size) return (parent->path + "/" + path);
+			else return path;
+		}
+		else {
+			return path;
+		}
+	}
 	Bit32u GetCRC32()
 	{
 		if (have_crc32) return crc32;
@@ -454,11 +462,22 @@ struct SFileRaw : SFile
 		if (!Open()) { size = 0; return; }
 		size = Seek(0, SEEK_END);
 		Close();
+		parent = this;
 	}
 	virtual inline ~SFileRaw() { Close(); }
-	virtual bool Open() { ZIP_ASSERT(!f); return ((f = fopen_utf8(path.c_str(), "rb")) != NULL); }
+	virtual bool Open() { 
+#ifndef NDEBUG
+		Log("Opening file %s\n", GetFullPath().c_str());
+#endif
+		ZIP_ASSERT(!f); return ((f = fopen_utf8(path.c_str(), "rb")) != NULL); 
+	}
 	virtual bool IsOpen() { return (f != NULL); }
-	virtual bool Close() { return (f ? (fclose(f), (f = NULL), true) : false); }
+	virtual bool Close() { 
+#ifndef NDEBUG
+		Log("Closing file %s\n\n", GetFullPath().c_str()); 
+#endif
+		return (f ? (fclose(f), (f = NULL), true) : false); 
+	}
 	virtual Bit64u Read(Bit8u* data, Bit64u len) { return (Bit64u)fread(data, 1, (size_t)len, f); }
 	//virtual Bit64u Write(const Bit8u* data, Bit64u len) { return (Bit64u)fwrite(data, 1, (size_t)len, f); }
 	virtual Bit64u Seek(Bit64s ofs, int origin = SEEK_SET) { fseek_wrap(f, ofs, origin); return (origin == SEEK_SET ? ofs : ftell_wrap(f)); }
@@ -706,17 +725,18 @@ struct SFileZip : SFileMemory
 	};
 
 	ZipReader& reader; Bit64u unpacked, data_ofs; Bit32u comp_size; Bit8u bit_flags, method; bool lhskip; void* decomp_state;
-	SFileZip(ZipReader& _reader, const char* filename, Bit32u filename_len, Bit64u _data_ofs, Bit32u _comp_size, Bit64u _decomp_size, Bit16u _date, Bit16u _time, Bit8u _bit_flags, Bit8u _method, Bit32u _crc32)
+	SFileZip(ZipReader& _reader, const char* filename, Bit32u filename_len, Bit64u _data_ofs, Bit32u _comp_size, Bit64u _decomp_size, Bit16u _date, Bit16u _time, Bit8u _bit_flags, Bit8u _method, Bit32u _crc32, SFile* _parent)
 		: SFileMemory(0), reader(_reader), unpacked(0), data_ofs(_data_ofs), comp_size(_comp_size), bit_flags(_bit_flags), method(_method), lhskip(false), decomp_state(NULL)
 	{
 		typ = T_ZIP;
-		(path.assign(reader.archive.path) += '/').append(filename, (size_t)filename_len);
+		path.assign("").append(filename, (size_t)filename_len); // reduces memory usage, can be combined with parent.path
 		size = _decomp_size;
 		date = _date;
 		time = _time;
 		crc32 = _crc32;
 		have_crc32 = true;
 		reader.AddRef();
+		parent = _parent;
 	}
 	virtual inline ~SFileZip()
 	{
@@ -735,7 +755,7 @@ struct SFileZip : SFileMemory
 			pos += readLen; return reader.archive.Read(data, readLen);
 		}
 		if (readEnd > unpacked && !Unpack(readEnd)) { ZIP_ASSERT(false); return 0; }
-		memcpy(data, buf+pos, (size_t)readLen); pos += readLen; return readLen;
+		memcpy(data, buf + pos, (size_t)readLen); pos += readLen; return readLen;
 	}
 
 	// Various ZIP archive enums. To completely avoid cross platform compiler alignment and platform endian issues, we don't use structs for any of this stuff
@@ -793,12 +813,10 @@ struct SFileZip : SFileMemory
 			invalid_zip:
 			if (fi.path.length() < 3 || (fi.path[fi.path.length()-3] | 0x20) != 'e') // don't log for .exe files
 				LogErr("Invalid or unsupported ZIP file: %s\n", fi.path.c_str());
-			if (fi.size >= ZIP_END_OF_CENTRAL_DIR_HEADER_SIZE) fi.Close();
 			return false;
 		}
 
 		// Find the end of central directory record by scanning the file from the end towards the beginning.
-		fi.Open();
 		Bit8u buf[4096];
 		Bit64u ecdh_ofs = (fi.size < sizeof(buf) ? 0 : fi.size - sizeof(buf));
 		for (;; ecdh_ofs = ZIP_MAX(ecdh_ofs - (sizeof(buf) - 3), 0))
@@ -809,7 +827,6 @@ struct SFileZip : SFileMemory
 			if (i >= 0) { ecdh_ofs += i; break; }
 			if (!ecdh_ofs || (fi.size - ecdh_ofs) >= (0xFFFF + ZIP_END_OF_CENTRAL_DIR_HEADER_SIZE)) goto invalid_zip;
 		}
-
 		// Read and verify the end of central directory record.
 		if (fi.Seek(ecdh_ofs) != ecdh_ofs || fi.Read(buf, ZIP_END_OF_CENTRAL_DIR_HEADER_SIZE) != ZIP_END_OF_CENTRAL_DIR_HEADER_SIZE)
 			goto invalid_zip;
@@ -908,8 +925,7 @@ struct SFileZip : SFileMemory
 			for (char *q = name, *name_end = name + filename_len; q != name_end; q++)
 				if (*q == '\\')
 					*q = '/'; // convert back-slashes to regular slashes
-
-			files.push_back(new SFileZip(*reader, name, filename_len, local_header_ofs, (Bit32u)comp_size, decomp_size, file_date, file_time, (Bit8u)bit_flag, (Bit8u)method, crc32));
+			files.push_back(new SFileZip(*reader, name, filename_len, local_header_ofs, (Bit32u)comp_size, decomp_size, file_date, file_time, (Bit8u)bit_flag, (Bit8u)method, crc32, fi.parent));
 		}
 		free(m_central_dir);
 		if (old_files_count == files.size()) delete reader;
@@ -1261,9 +1277,9 @@ struct SFileIso : SFile
 					track.file = NULL;
 
 					std::string tmpImgPath;
-					char* imgPath = &tmpImgPath.assign(fi.path).append("/../").append(pName, pEOName - pName).append(1, '\0')[0];
+					char* imgPath = &tmpImgPath.assign(fi.GetFullPath()).append("/../").append(pName, pEOName - pName).append(1, '\0')[0];
 					size_t imgPathLen;
-					for (char* pip = imgPath, *pipWrite = pip, *pipCuePart = pip + fi.path.length();;) // fix up '/../', '/./' and '//'
+					for (char* pip = imgPath, *pipWrite = pip, *pipCuePart = pip + fi.GetFullPath().length();;) // fix up '/../', '/./' and '//'
 					{
 						if (pip[0] == '\\' && pip >= pipCuePart) pip[0] = '/';
 						int skip = (pip[0] == '/' ? ((pip[1] == '.' && pip[2] == '.' && pip[3] == '/') ? 3 : ((pip[1] == '.' && pip[2] == '/') ? 2 : ((pip[1] == '/') ? 1 : 0))) : 0);
@@ -1278,7 +1294,7 @@ struct SFileIso : SFile
 
 					SFile* imgFile = NULL;
 					for (SFile* fil : files)
-						if (fil->path.length() == imgPathLen && !strncasecmp(&fil->path[0], imgPath, imgPathLen))
+						if (fil->GetFullPath().length() == imgPathLen && !strncasecmp(&fil->GetFullPath()[0], imgPath, imgPathLen))
 							{ imgFile = fil; break; }
 					if (!imgFile)
 					{
@@ -1290,7 +1306,7 @@ struct SFileIso : SFile
 
 					if (!imgFile)
 					{
-						LogErr("Unable to find image '%.*s' used by CD-ROM CUE '%s'\n", (int)imgPathLen, imgPath, fi.path.c_str());
+						LogErr("Unable to find image '%.*s' used by CD-ROM CUE '%s'\n", (int)imgPathLen, imgPath, fi.GetFullPath().c_str());
 					}
 					else
 					{
@@ -1304,7 +1320,8 @@ struct SFileIso : SFile
 			}
 
 			// add last track
-			if (!AddTrack(tracks, track, total_omitted_pregap)) return false;
+			// added if (canAddTrack) to ensure we can add a track
+			if (canAddTrack) if (!AddTrack(tracks, track, total_omitted_pregap)) return false;
 
 			// add leadout track
 			do_leadout:
@@ -1312,7 +1329,7 @@ struct SFileIso : SFile
 			track.start = track.pregap = track.frames = -1;
 			track.audio = false;
 			track.file = NULL;
-			if (!AddTrack(tracks, track, total_omitted_pregap)) return false;
+			if (canAddTrack) if (!AddTrack(tracks, track, total_omitted_pregap)) return false;
 
 			return true;
 		}
@@ -1512,7 +1529,7 @@ struct SFileIso : SFile
 			return de.length;
 		}
 
-		void IterateDir(isoDirEntry& deDir, bool iso, std::vector<SFile*>& files, std::string& ipath)
+		void IterateDir(isoDirEntry& deDir, bool iso, std::vector<SFile*>& files, std::string& ipath, SFile& fi)
 		{
 			Bit32u currentSector = deDir.extentLocation, endSector = deDir.extentLocation + deDir.dataLength / ISO_FRAMESIZE - 1 + ((deDir.dataLength % ISO_FRAMESIZE != 0) ? 1 : 0);
 			Bit8u buffer[ISO_FRAMESIZE];
@@ -1540,11 +1557,11 @@ struct SFileIso : SFile
 				ipath.append((const char*)deFile.ident, deFile.fileIdentLength);
 				if (ISO_IS_DIR(&deFile))
 				{
-					files.push_back(new SFileIso(*this, (ipath += '/'), 0, ZIP_PACKDATE(deFile.dateYear + 1900, deFile.dateMonth, deFile.dateDay), ZIP_PACKTIME(deFile.timeHour, deFile.timeMin, deFile.timeSec), deFile.extentLocation));
-					IterateDir(deFile, iso, files, ipath);
+					files.push_back(new SFileIso(*this, (ipath += '/'), 0, ZIP_PACKDATE(deFile.dateYear + 1900, deFile.dateMonth, deFile.dateDay), ZIP_PACKTIME(deFile.timeHour, deFile.timeMin, deFile.timeSec), deFile.extentLocation, fi.parent));
+					IterateDir(deFile, iso, files, ipath, fi);
 				}
 				else
-					files.push_back(new SFileIso(*this, ipath, deFile.dataLength, ZIP_PACKDATE(deFile.dateYear + 1900, deFile.dateMonth, deFile.dateDay), ZIP_PACKTIME(deFile.timeHour, deFile.timeMin, deFile.timeSec), deFile.extentLocation));
+					files.push_back(new SFileIso(*this, ipath, deFile.dataLength, ZIP_PACKDATE(deFile.dateYear + 1900, deFile.dateMonth, deFile.dateDay), ZIP_PACKTIME(deFile.timeHour, deFile.timeMin, deFile.timeSec), deFile.extentLocation, fi.parent));
 			}
 		}
 	};
@@ -1568,9 +1585,7 @@ struct SFileIso : SFile
 	{
 		std::vector<IsoReader::Track> tracks;
 		IsoReader::ChdState* chd = NULL;
-		fi.Open();
 		bool loaded = IsoReader::LoadISO(fi, tracks) || IsoReader::LoadCUE(fi, tracks, files) || IsoReader::LoadCHD(fi, tracks, chd);
-		fi.Close();
 		if (!loaded || tracks.size() <= 1) return false; // must have at least 1 regular track and 1 leadout track
 
 		bool havedata = false, iso = false;
@@ -1588,21 +1603,22 @@ struct SFileIso : SFile
 
 			IsoReader::isoDirEntry rootEntry;
 			if (havedata && IsoReader::ReadDirEntry(rootEntry, &pvd[iso ? 156 : 180], iso) > 0)
-				reader->IterateDir(rootEntry, iso, files, ((tmppath = fi.path) += '/'));
+				reader->IterateDir(rootEntry, iso, files, ((tmppath = fi.path) += '/'), fi);
 		}
 		if (old_files_count == files.size())
-			files.push_back(new SFileIso(*reader, (tmppath = fi.path).append("/\b"), 0, 0, 0, 0)); // fake file for keeping IsoReader reference to potentially generate CHD
+			files.push_back(new SFileIso(*reader, (tmppath = fi.path).append("/\b"), 0, 0, 0, 0, fi.parent)); // fake file for keeping IsoReader reference to potentially generate CHD
 		return true;
 	}
 
 	Bit64u pos; IsoReader& reader; Bit32u firstsector;
-	inline SFileIso(IsoReader& _reader, const std::string& _path, Bit64u _size, Bit16u _date, Bit16u _time, Bit32u _firstsector) : pos((Bit64u)-1), reader(_reader), firstsector(_firstsector)
+	inline SFileIso(IsoReader& _reader, const std::string& _path, Bit64u _size, Bit16u _date, Bit16u _time, Bit32u _firstsector, SFile* _parent) : pos((Bit64u)-1), reader(_reader), firstsector(_firstsector)
 	{
 		typ = T_ISO;
 		path = _path;
 		size = _size;
 		date = _date;
 		time = _time;
+		parent = _parent;
 		reader.AddRef();
 	}
 	virtual inline ~SFileIso() { reader.DelRef(); }
@@ -2380,10 +2396,14 @@ struct SFileIso : SFile
 			lastReader = &((SFileIso*)fil)->reader;
 
 			BuiltTrack* pBT = NULL;
-			if (!lastReader->TestOrFillTrackBuf((builtFile ? &pBT : NULL), (int)frames, data_size, in_zeros, out_zeros, (omitted_pregap > 0), (ssha1 ? ssha1 : romSha1))) continue;
-			if (!builtFile) return true; // potential match
+			if (fil->parent != NULL && !fil->parent->IsOpen()) fil->parent->Open();
+			if (!lastReader->TestOrFillTrackBuf((builtFile ? &pBT : NULL), (int)frames, data_size, in_zeros, out_zeros, (omitted_pregap > 0), (ssha1 ? ssha1 : romSha1))) { if (fil->parent != NULL && fil->parent->IsOpen()) { fil->parent->Close(); } continue; }
+			if (!builtFile) {
+				if (fil->parent != NULL && fil->parent->IsOpen()) { fil->parent->Close(); } return true;
+			} // potential match 
 			*builtFile = BuildBINOGGFromTrack(*pBT, romSize, romSha1, (squality ? atoi(squality) : 8), ssha1);
 			delete pBT;
+			if (fil->parent != NULL && fil->parent->IsOpen()) fil->parent->Close();
 			if (*builtFile) { (*builtFile)->path.assign(lastReader->src.path).append("|TRACK"); return true; }
 		}
 		return false;
@@ -2598,7 +2618,7 @@ struct SFileFat : SFile
 			return ((clustNum - 2) * partition_cluster_sectors) + firstDataSector + (logicalSector % partition_cluster_sectors);
 		}
 
-		bool IterateDir(const Bit32u dirClustNumber, const Bit32u parentDirClustNumber, std::vector<SFile*>& files, std::string& ipath, Bit16u root_dir_entries = 0)
+		bool IterateDir(const Bit32u dirClustNumber, const Bit32u parentDirClustNumber, std::vector<SFile*>& files, std::string& ipath, SFile& fi, Bit16u root_dir_entries = 0)
 		{
 			enum { DOS_ATTR_READ_ONLY = 0x01, DOS_ATTR_HIDDEN = 0x02, DOS_ATTR_SYSTEM = 0x04, DOS_ATTR_VOLUME = 0x08, DOS_ATTR_DIRECTORY = 0x10, DOS_ATTR_ARCHIVE = 0x20, DOS_ATTR_DEVICE = 0x40 };
 
@@ -2637,11 +2657,11 @@ struct SFileFat : SFile
 				ipath.append(name, name_len);
 				if (entry.attrib & DOS_ATTR_DIRECTORY)
 				{
-					files.push_back(new SFileFat(*this, (ipath += '/'), 0, entry.modDate, entry.modTime, entryClustNumber));
-					IterateDir(entryClustNumber, dirClustNumber, files, ipath);
+					files.push_back(new SFileFat(*this, (ipath += '/'), 0, entry.modDate, entry.modTime, entryClustNumber, fi.parent));
+					IterateDir(entryClustNumber, dirClustNumber, files, ipath, fi);
 				}
 				else
-					files.push_back(new SFileFat(*this, ipath, entry.entrysize, entry.modDate, entry.modTime, entryClustNumber));
+					files.push_back(new SFileFat(*this, ipath, entry.entrysize, entry.modDate, entry.modTime, entryClustNumber, fi.parent));
 			}
 		}
 	};
@@ -2660,7 +2680,6 @@ struct SFileFat : SFile
 		bool is_hdd = (sizekb > 2880);
 		if (is_hdd)
 		{
-			fi.Open();
 			for (int m = (FatReader::Read_AbsoluteSector(fi, 0, (Bit8u*)&mbr) ? 0 : 4); m != 4; m++)
 			{
 				if (!mbr.pentry[m].partSize) continue; // should this also test valid FAT partition types?
@@ -2668,7 +2687,7 @@ struct SFileFat : SFile
 				partSize     = FatReader::VarRead(mbr.pentry[m].partSize);
 				break;
 			}
-			if (!partSize || mbr.magic[0] != 0x55 || mbr.magic[1] != 0xaa) { fi.Close(); return false; }
+			if (!partSize || mbr.magic[0] != 0x55 || mbr.magic[1] != 0xaa) { return false; }
 		}
 		else
 		{
@@ -2697,10 +2716,9 @@ struct SFileFat : SFile
 				break;
 			}
 			if (!trackSectors) return false;
-			fi.Open();
 		}
 
-		if (!FatReader::Read_AbsoluteSector(fi, startSector, (Bit8u*)&boot)) { fi.Close(); return false; }
+		if (!FatReader::Read_AbsoluteSector(fi, startSector, (Bit8u*)&boot)) { return false; }
 		boot.bytespersector    = FatReader::VarRead(boot.bytespersector);
 		boot.reservedsectors   = FatReader::VarRead(boot.reservedsectors);
 		boot.rootdirentries    = FatReader::VarRead(boot.rootdirentries);
@@ -2737,7 +2755,6 @@ struct SFileFat : SFile
 				if (mdesc < 0xf8)
 				{
 					// Unknown format
-					fi.Close();
 					return false;
 				}
 
@@ -2777,24 +2794,25 @@ struct SFileFat : SFile
 
 		// Sanity checks (FAT32 and non-standard sector sizes not implemented)
 		if (!boot.sectorsperfat || boot.bytespersector != FatReader::SECTOR_SIZE || !boot.sectorspercluster || !boot.rootdirentries || !boot.fatcopies || !boot.headcount || boot.headcount > heads || !boot.sectorspertrack || boot.sectorspertrack > trackSectors)
-			{ fi.Close(); return false; }
+			{ return false; }
 
 		FatReader* reader = new FatReader(&fi, trackSectors, heads, cylinders, startSector, boot); // pass already opened file
 		std::string path = fi.path;
 		size_t old_files_count = files.size();
-		reader->IterateDir(0, 0, files, path, boot.rootdirentries);
+		reader->IterateDir(0, 0, files, path, fi, boot.rootdirentries);
 		if (old_files_count == files.size()) delete reader;
 		return true;
 	}
 
 	Bit64u pos; FatReader& reader; Bit32u chaincluster;
-	inline SFileFat(FatReader& _reader, const std::string& _path, Bit64u _size, Bit16u _date, Bit16u _time, Bit32u _chaincluster) : pos((Bit64u)-1), reader(_reader), chaincluster(_chaincluster)
+	inline SFileFat(FatReader& _reader, const std::string& _path, Bit64u _size, Bit16u _date, Bit16u _time, Bit32u _chaincluster, SFile* _parent) : pos((Bit64u)-1), reader(_reader), chaincluster(_chaincluster)
 	{
 		typ = T_FAT;
 		path = _path;
 		size = _size;
 		date = _date;
 		time = _time;
+		parent = _parent;
 		reader.AddRef();
 	}
 	virtual inline ~SFileFat() { reader.DelRef(); }
@@ -2917,10 +2935,12 @@ static bool BuildRom(char* pGameInner, char* gameName, char* gameNameX, const st
 		SFile* romFile = NULL;
 		for (SFile* fi : files)
 		{
-			if (fi->size != size || fi->IsContainedBy(outPath, outPathLen) || fi->GetCRC32() != (Bit32u)atoi64(romCrc, 0x10)) continue;
-			if (!size && (fi->path.back() == '\\' || fi->path.back() == '/')) continue; // don't assign directory to empty files
+			if (fi->parent != nullptr && !fi->parent->IsOpen() && !fi->have_crc32) fi->parent->Open();
+			if (fi->size != size || fi->IsContainedBy(outPath, outPathLen) || fi->GetCRC32() != (Bit32u)atoi64(romCrc, 0x10)) { if (fi->parent != nullptr && fi->parent->IsOpen()) { fi->parent->Close(); } continue; }
+			if (fi->parent != nullptr && !fi->parent->IsOpen()) fi->parent->Open();
+			if (!size && (fi->GetFullPath().back() == '\\' || fi->GetFullPath().back() == '/')) { if (fi->parent != nullptr && fi->parent->IsOpen()) { fi->parent->Close(); } continue; } // don't assign directory to empty files
 			Bit8u romSha1b[20];
-			if (!fi->GetSHA1() || !hextouint8(romSha1, romSha1b, 20) || memcmp(fi->sha1, romSha1b, 20)) continue;
+			if (!fi->GetSHA1() || !hextouint8(romSha1, romSha1b, 20) || memcmp(fi->sha1, romSha1b, 20)) { if (fi->parent != nullptr && fi->parent->IsOpen()) { fi->parent->Close(); } continue; }
 			if (useSrcDates)
 			{
 				XMLInlineStringConvert(romName, romNameX);
@@ -2928,10 +2948,12 @@ static bool BuildRom(char* pGameInner, char* gameName, char* gameNameX, const st
 				if (romNameLen > filMatch) // not yet a full match
 				{
 					if (!romFile || filMatch > romFile->PathMatch(romName, romNameLen)) romFile = fi; // but a better match
+					if (fi->parent != nullptr && fi->parent->IsOpen()) fi->parent->Close();
 					continue; // continue search
 				}
 			}
 			romFile = fi;
+			if (fi->parent != nullptr && fi->parent->IsOpen()) fi->parent->Close();
 			break;
 		}
 		if (!romFile) // attempt to generate simple files
@@ -3019,7 +3041,13 @@ static bool BuildRom(char* pGameInner, char* gameName, char* gameNameX, const st
 			ZIP_ASSERT(size == (romFile ? romFile->size : 0));
 			XMLInlineStringConvert(romName, romNameX);
 			if (!isFix) Log("    %sing [%s] as [%.*s]...\n", (romFile ? "Stor" : "Writ"), (romFile ? romFile->path.c_str() : ((romNameX[-1] == '/' || romNameX[-1] == '\\') ? "<DIRECTORY>" : "<EMPTY FILE>")), (int)(romNameX - romName), romName);
+			if (romFile) if (romFile->parent != NULL && romFile->size > 6 && romFile->path != "<EMBEDDED>") {
+				romFile->parent->Open();
+			}
 			w->WriteFile(romName, (size_t)(romNameX - romName), zdate, ztime, romFile, isFix);
+			if (romFile) if (romFile->parent != NULL && romFile->size > 6 && romFile->path != "<EMBEDDED>") {
+				romFile->parent->Close();
+			}
 		}
 		if (!w->Finalize(pGameInner)) LogErr("  ERROR: Unknown error writing output file %s\n\n", outPath);
 		else if (!isFix) Log("  Done! Successfully wrote %.*s with %u files!\n\n", (int)(gameNameX - gameName), gameName, needRoms);
@@ -3037,7 +3065,7 @@ static bool VerifyGame(char* pGameInner, char* gameName, char* gameNameX, const 
 	if (workPath.length() < 5 || ((&workPath.back())[-3] != '.' && (&workPath.back())[-4] != '.')) workPath.append(".zip");
 	SFileRaw gameFi(workPath, false);
 	if (!gameFi.size) { if (notFound) *notFound = true; return false; }
-
+	gameFi.Open();
 	bool isISO = false;
 	const char *gameFiPath = gameFi.path.c_str(), *ext3, *ext4;
 	PathGetExt(gameFiPath, gameFi.path.length(), ext3, ext4);
@@ -3073,17 +3101,24 @@ static bool VerifyGame(char* pGameInner, char* gameName, char* gameNameX, const 
 			*romDateX = romDate[-1]; // undo null terminate
 		}
 		XMLInlineStringConvert(romName, romNameX);
-		for (SFile* fi : gameFiles)
+		for (size_t i = 0, numFiles = gameFiles.size(); i != numFiles; i++)
 		{
-			if ((size_t)(romNameX - romName) != (size_t)(fi->path.length() - romBasePathLen)) continue;
-			if (memcmp(romName, fi->path.c_str() + romBasePathLen, (romNameX - romName))) continue;
-			matchName = fi->was_matched = true;
-			matchFile = fi;
-			matchDate = (zdate == fi->date);
-			matchTime = (ztime == fi->time);
-			if ((matchSize = (size == fi->size)) == false) break;
-			if ((matchCrc32 = (fi->GetCRC32() == (Bit32u)atoi64(romCrc, 0x10))) == false) break;
-			matchSha1 = (crcOnlyCheck || (fi->GetSHA1() && hextouint8(romSha1, romSha1b, 20) && !memcmp(fi->sha1, romSha1b, 20)));
+			SFile& fi = *gameFiles[i];
+			if (fi.parent != NULL && !fi.parent->IsOpen()) fi.parent->Open();
+			if (matchFile && !matchFile->parent->IsOpen()) matchFile->parent->Open();
+			size_t length = (size_t)(fi.GetFullPath().length() - romBasePathLen);
+			size_t romLength = (size_t)(romNameX - romName);
+			if (romLength != length) { if (fi.parent != NULL && fi.parent->IsOpen()) { fi.parent->Close(); } continue; }
+			if (memcmp(romName, fi.GetFullPath().c_str() + romBasePathLen, (romNameX - romName))) { if (fi.parent != NULL && fi.parent->IsOpen()) { fi.parent->Close(); } continue; }
+			matchName = fi.was_matched = true;
+			matchFile = &fi;
+			matchDate = (zdate == fi.date);
+			matchTime = (ztime == fi.time);
+			if ((matchSize = (size == fi.size)) == false) { if (fi.parent != NULL && fi.parent->IsOpen()) { fi.parent->Close(); } break; }
+			if ((matchCrc32 = (fi.GetCRC32() == (Bit32u)atoi64(romCrc, 0x10))) == false) { if (fi.parent != NULL && fi.parent->IsOpen()) { fi.parent->Close(); } break; }
+			matchSha1 = (crcOnlyCheck || (fi.GetSHA1() && hextouint8(romSha1, romSha1b, 20) && !memcmp(fi.sha1, romSha1b, 20)));
+			if (matchFile && matchFile->parent->IsOpen()) matchFile->parent->Close();
+			if (fi.parent != NULL && fi.parent->IsOpen()) fi.parent->Close();
 			break;
 		}
 
@@ -3291,11 +3326,50 @@ int main(int argc, char *argv[])
 			SFile& fil = *files[i];
 			const char *ext3, *ext4;
 			PathGetExt(fil.path.c_str(), fil.path.length(), ext3, ext4);
-			if      (SFileZip::UsesExtension(ext3, ext4, false) &&  SFileZip::IndexFiles(fil, files)) {}
-			else if (SFileIso::UsesExtension(ext3, false) &&        SFileIso::IndexFiles(fil, files)) {}
-			else if (SFileFat::UsesExtension(ext3) &&               SFileFat::IndexFiles(fil, files)) {}
-			else continue;
+			if (fil.parent != nullptr)
+				if (i != 0) {
+					if (fil.parent != files[i - 1]->parent)
+					{
+						fil.parent->Open();
+					}
+				}
+				else {
+					fil.parent->Open();
+				}
+			#ifndef NDEBUG
+			if (fil.parent != nullptr) { Log("Getting file %s:%s\n", fil.GetFullPath().c_str(), fil.parent->IsOpen() ? "True" : "False"); }
+			else Log("Getting folder %s\n", fil.GetFullPath().c_str());
+			#endif
+			fil.GetCRC32(); // should be less expensive than opening fi every time in BuildRom
+			if (SFileZip::UsesExtension(ext3, ext4, false) && SFileZip::IndexFiles(fil, files)) {}
+			else if (SFileIso::UsesExtension(ext3, false) && SFileIso::IndexFiles(fil, files)) {}
+			else if (SFileFat::UsesExtension(ext3) && SFileFat::IndexFiles(fil, files)) {}
+			else { 
+				if (fil.parent != nullptr) {
+					if (i != numFiles-1) {
+						if (fil.parent != files[i + 1]->parent)
+						{
+							fil.parent->Close();
+						}
+					}
+					else {
+						fil.parent->Close();
+					}
+				}
+				continue;
+			}
 			numFiles = files.size();
+			if (fil.parent != nullptr) {
+				if (i != numFiles - 1) {
+					if (fil.parent != files[i + 1]->parent)
+					{
+						fil.parent->Close();
+					}
+				}
+				else {
+					fil.parent->Close();
+				}
+			}
 		}
 		//for (const SFile* fil : files) Log(" - %s (size=\"%u\" date=\"%04d-%02d-%02d %02d:%02d:%02d\")\n", fil->path.c_str(), (unsigned)fil->size, ((fil->date >> 9) + 1980), ((fil->date >> 5) & 0xf), (fil->date & 0x1f), (fil->time >> 11), ((fil->time >> 5) & 0x3f), ((fil->time & 0x1f) * 2));return 0;
 		Log("Finished indexing available files\n\n");
@@ -4271,7 +4345,7 @@ bool SFileZip::Unpack(Bit64u unpack_until)
 		unpacked = size;
 	}
 	else { bad: ZIP_ASSERT(false); size = 0; return false; }
-	ZIP_ASSERT(size > 5000000 || unpacked < size || CRC32(buf, (size_t)size) == crc32);
+	ZIP_ASSERT(size > 5000000 || unpacked < size || CRC32(buf, (size_t)size) == crc32); todo change back
 	return true;
 }
 
